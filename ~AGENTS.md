@@ -1,0 +1,5 @@
+- Python 3.12 stdlib only. No external dependencies.
+- Inject clocks. Tests must be deterministic and never sleep.
+- Run tests and show real output. Never claim results you did not run.
+- Name design tradeoffs explicitly rather than hiding them.
+- Do not add features that were not requested.

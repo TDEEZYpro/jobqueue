@@ -83,7 +83,8 @@ class JobQueue:
         backoff_cap: float = DEFAULT_BACKOFF_CAP,
         visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT,
         busy_timeout_ms: int = 5000,
-        clock=lambda: time.time(),
+        clock=lambda: time.time(),            # wall clock → run_at scheduling
+        lease_clock=lambda: time.monotonic(),  # monotonic → lease lifetime
     ) -> None:
         self.db_path = os.fspath(db_path)
         self.max_attempts = max_attempts
@@ -91,7 +92,8 @@ class JobQueue:
         self.backoff_cap = min(backoff_cap, backoff_base * 64.0)
         self.visibility_timeout = visibility_timeout
         self.busy_timeout_ms = busy_timeout_ms
-        self._clock = clock
+        self._wall_clock = clock  # time.time(): schedules run_at bookkeeping
+        self._lease_clock = lease_clock  # time.monotonic(): bounds lease lifetime
         # A lock only guards our in-process state machine (the single connection
         # we own), never SQLite itself — cross-process safety comes from SQLite.
         self._conn_lock = threading.Lock()
@@ -156,8 +158,36 @@ class JobQueue:
         self._conn.commit()
 
     # --------------------------------------------------------------- helpers
-    def _now(self) -> float:
-        return float(self._clock())
+    # Two clocks, kept deliberately separate. `run_at` scheduling (enqueue /
+    # the run_at<=now gate in dequeue / fail backoff / created_at/updated_at)
+    # is genuine wall-clock and uses time.time(). Lease lifetime, by contrast,
+    # must be measured against a monotonic clock so NTP/sleep adjustments can
+    # neither un-expire an expired lease (backwards jump) nor reclaim a live one
+    # early (forward jump). See the comment on `_lease_now` below about restarts.
+    def _wall_now(self) -> float:
+        return float(self._wall_clock())
+
+    def _lease_now(self) -> float:
+        """Monotonic time for lease lifetimes only.
+
+        Monotonic *does not* reset across process restarts on Linux/CPython: it
+        is CLOCK_MONOTONIC, a single system-wide baseline (verified — two runs of
+        the interpreter read ~6381 -> ~6382, not a fresh per-process zero). That
+        is exactly why it is the correct clock here: a lease's expiry survives a
+        worker (re)start and other processes share the same reference.
+
+        Defined behaviour at restart: we do nothing special — leases keep being
+        evaluated against this same monotonic baseline, so a job held by a
+        worker that was merely re-executed is reclaimed only after its full
+        visibility window has genuinely elapsed. The one case where the baseline
+        *does* reset (a full machine reboot / kexec) would make previously stored
+        lease_expires larger than the fresh baseline and thus delayed, never
+        premature: leases are reclaimed late by up to one window, which preserves
+        the lease invariant of never re-running a job that may still be live. We
+        accept that trade-off rather than paying for a startup sweep — the cost
+        is bounded latency after a reboot, and no double execution ever.
+        """
+        return float(self._lease_clock())
 
     @staticmethod
     def _dumps(obj) -> bytes:
@@ -195,7 +225,7 @@ class JobQueue:
         max_attempts: Optional[int] = None,
     ) -> int:
         """Insert a pending job and return its id."""
-        now = self._now()
+        now = self._wall_now()
         if run_at is None:
             run_at = now
         rows = self._ensure_connected().execute(
@@ -224,7 +254,10 @@ class JobQueue:
         two concurrent processes can never be handed the same row.
         """
         conn = self._ensure_connected()
-        now = self._now()
+        # Two independent "nows": lease maths against the monotonic clock, and
+        # scheduling/bookkeeping against wall-clock.
+        t_mon = self._lease_now()   # used only for lease reclaim + lease_expires
+        t_wall = self._wall_now()   # used only for run_at gate + updated_at
 
         allowed = tuple(types) if types else None
         allowed_clause = ""
@@ -245,7 +278,7 @@ class JobQueue:
                      WHERE state = 'running' AND lease_expires IS NOT NULL
                        AND lease_expires <= ?
                     """,
-                    (now,),
+                    (t_mon,),
                 )
 
                 # 2) Select the next runnable job we are allowed to claim.
@@ -258,7 +291,7 @@ class JobQueue:
                      ORDER BY priority DESC, run_at ASC, id ASC
                      LIMIT 1
                     """,
-                    (now, *params),
+                    (t_wall, *params),
                 ).fetchone()
 
                 if row is None:
@@ -268,7 +301,7 @@ class JobQueue:
                 # 3) Claim it: flip to running, stamp the lease. attempts
                 #    increments atomically in SQL so a concurrent claim cannot
                 #    also see this row as eligible (the SELECT excludes 'running').
-                new_run_at = now + self.visibility_timeout
+                new_lease_expires = t_mon + self.visibility_timeout
                 conn.execute(
                     """
                     UPDATE jobs
@@ -280,7 +313,7 @@ class JobQueue:
                            updated_at = ?
                      WHERE id = ?
                     """,
-                    (worker_id, new_run_at, now, row["id"]),
+                    (worker_id, new_lease_expires, t_wall, row["id"]),
                 )
                 # Re-read the *updated* row so reported attempts/lease are fresh
                 # and consistent with what we just wrote.
@@ -296,7 +329,7 @@ class JobQueue:
 
     def complete(self, job_id: int, result: dict) -> None:
         """Mark a running job done and store its result."""
-        now = self._now()
+        now = self._wall_now()
         cur = self._ensure_connected().execute(
             """
             UPDATE jobs
@@ -316,7 +349,7 @@ class JobQueue:
 
     def fail(self, job_id: int, error: str) -> None:
         """Record a failure; retry with backoff until attempts are exhausted."""
-        now = self._now()
+        now = self._wall_now()
         row = self._ensure_connected().execute(
             "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()

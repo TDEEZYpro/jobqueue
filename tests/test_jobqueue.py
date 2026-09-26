@@ -1,4 +1,10 @@
-"""Deterministic unit tests. No real time is slept; the clock is injected."""
+"""Deterministic unit tests. No real time is slept; clocks are injected.
+
+Two injectable clocks exist now: `clock` (wall, time.time) drives run_at
+scheduling/bookkeeping and `lease_clock` (monotonic, time.monotonic) bounds
+lease lifetimes. They can be advanced independently — that independence is the
+subject of test_two_clocks_are_separate.
+"""
 
 import os
 import tempfile
@@ -18,11 +24,11 @@ class FakeClock:
         return self.now
 
 
-def make_queue(**kw):
+def make_queue(**kwargs):
     tmp = tempfile.mkdtemp()
     path = os.path.join(tmp, "queue.db")
-    kw.setdefault("max_attempts", 3)
-    q = JobQueue(path, **kw)
+    kwargs.setdefault("max_attempts", 3)
+    q = JobQueue(path, **kwargs)
     return q, path
 
 
@@ -43,14 +49,14 @@ class DequeueOrderingTests(unittest.TestCase):
         a = q.enqueue("alpha", {})
         b = q.enqueue("beta", {})
         self.assertEqual(q.dequeue("w", types=["beta"]).id, b)
-        self.assertEqual(q.dequeue("w", types=["beta"]) is None, True)
+        self.assertIsNone(q.dequeue("w", types=["beta"]))
         # alpha still available under its own filter
         self.assertEqual(q.dequeue("w2", types=["alpha"]).id, a)
 
 
 class ScheduledTests(unittest.TestCase):
     def test_present_time_dequeued_immediately(self):
-        clk = FakeClock()
+        clk = FakeClock()  # wall clock
         q, _ = make_queue(clock=clk)
         now_job = q.enqueue("t", {}, run_at=clk.now)
         self.assertEqual(q.dequeue("w").id, now_job)
@@ -84,7 +90,7 @@ class LifecycleTests(unittest.TestCase):
 
 class RetryTests(unittest.TestCase):
     def test_backoff_then_dead(self):
-        clk = FakeClock(1000.0)
+        clk = FakeClock(1000.0)  # wall clock drives run_at/backoff
         q, _ = make_queue(clock=clk, max_attempts=3, backoff_base=1.0, backoff_cap=60.0)
         jid = q.enqueue("t", {})
 
@@ -93,7 +99,7 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(job.attempts, 1)
         q.fail(jid, "boom")
         self.assertEqual(q.count_by_state().get(State.PENDING), 1)
-        # not runnable yet
+        # not runnable yet (run_at in the future on the wall clock)
         self.assertIsNone(q.dequeue("w"))
 
         # need +1s to become runnable; also exercise lease reclamation implicitly
@@ -125,8 +131,10 @@ class RetryTests(unittest.TestCase):
 
 class LeaseTests(unittest.TestCase):
     def test_lease_prevents_reclaim_until_timeout(self):
-        clk = FakeClock()
-        q, _ = make_queue(clock=clk, visibility_timeout=30.0)
+        wall = FakeClock(100.0)   # stays fixed; run_at gating lives on this clock
+        lease = FakeClock(5000.0)  # the monotonic clock that bounds the lease
+        q, _ = make_queue(clock=wall, lease_clock=lease,
+                          visibility_timeout=30.0, max_attempts=3)
         jid = q.enqueue("t", {})
 
         a = q.dequeue("w1")
@@ -135,15 +143,46 @@ class LeaseTests(unittest.TestCase):
         self.assertIsNone(q.dequeue("w2"))
 
         # before timeout: still held (and not reclaimable as pending)
-        clk.advance(29.0)
+        lease.advance(29.0)
         self.assertEqual(q.count_by_state().get(State.RUNNING), 1)
         self.assertEqual(q.count_by_state().get(State.PENDING), 0)
 
         # after the lease expires, another worker can reclaim it
-        clk.advance(1.0)
+        lease.advance(1.0)
         reclaimed = q.dequeue("w2")
         self.assertEqual(reclaimed.id, jid)
         self.assertEqual(reclaimed.attempts, 2)
+
+
+class ClockSeparationTests(unittest.TestCase):
+    """Proves the two clocks are genuinely independent."""
+
+    def test_wall_jump_does_not_reclaim_live_lease(self):
+        # A large forward wall-clock jump (as NTP could cause) must not expire a
+        # lease, because leases ride on the monotonic clock, not the wall one.
+        wall = FakeClock(0.0)
+        lease = FakeClock(1000.0)
+        q, _ = make_queue(clock=wall, lease_clock=lease,
+                          visibility_timeout=30.0, max_attempts=3)
+        jid = q.enqueue("t", {})
+
+        self.assertEqual(q.dequeue("w1").id, jid)  # leased at lease-clock 1000 -> expires 1030
+        wall.advance(10_000)                       # wall clock surges forward massively
+        self.assertIsNone(q.dequeue("w2"))         # lease still live on monotonic clock
+
+    def test_lease_advances_independent_of_run_at(self):
+        # Advancing the lease clock expires a job while run_at gating (wall clock)
+        # is untouched — the job that was already runnable stays claimable.
+        wall = FakeClock(0.0)
+        lease = FakeClock(1000.0)
+        q, _ = make_queue(clock=wall, lease_clock=lease,
+                          visibility_timeout=30.0, max_attempts=3)
+        # run_at in the past on the wall clock => immediately runnable
+        jid = q.enqueue("t", {}, run_at=-100.0)
+
+        self.assertEqual(q.dequeue("w1").id, jid)
+        lease.advance(31.0)  # visibility window elapses
+        self.assertEqual(q.dequeue("w2").id, jid)  # reclaimed purely on lease clock
 
 
 if __name__ == "__main__":
