@@ -89,6 +89,63 @@ class LifecycleTests(unittest.TestCase):
             q.complete(jid, {})  # still pending
 
 
+class OwnershipTests(unittest.TestCase):
+    """Proves complete()/fail() reject a stale worker who lost the job.
+
+    This is finding #1: without an ownership guard, a worker whose lease expired
+    mid-job could overwrite the report of the worker who re-claimed it. A new,
+    optional `worker_id` argument makes completion/failure match on (id,
+    state='running', worker_id); matching zero rows is a silent drop, never a
+    retry (finding #3).
+    """
+
+    def test_stale_complete_is_rejected_but_live_owner_completes(self):
+        lease = FakeClock(5000.0)
+        q, _ = make_queue(lease_clock=lease, visibility_timeout=30.0)
+        jid = q.enqueue("t", {"i": 1})
+
+        a = q.dequeue("wA")          # worker A claims it
+        self.assertEqual(a.id, jid)
+        b = q.dequeue("wB")          # still leased -> B cannot grab it yet
+        self.assertIsNone(b)
+
+        # lease expires; B re-claims as its own attempt (attempts == 2)
+        lease.advance(31.0)
+        b = q.dequeue("wB")
+        self.assertEqual(b.id, jid)
+        self.assertEqual(b.attempts, 2)
+
+        # A's report is now stale: it must be silently dropped, not raise and
+        # not overwrite the live owner.
+        self.assertIsNone(q.complete(jid, {"stale": True}, worker_id="wA"))
+
+        # B's report wins: job completes exactly once.
+        self.assertIsNone(q.complete(jid, {"ok": True}, worker_id="wB"))
+
+        states = q.count_by_state()
+        self.assertEqual(states.get(State.DONE), 1)
+        self.assertEqual(states.get(State.RUNNING), 0)
+
+    def test_stale_fail_is_not_retried(self):
+        lease = FakeClock(5000.0)
+        q, _ = make_queue(lease_clock=lease, visibility_timeout=30.0,
+                          max_attempts=3)
+        jid = q.enqueue("t", {"i": 1})
+
+        q.dequeue("wA")     # A claims (attempt 1)
+        lease.advance(31.0)  # lease expires
+        b = q.dequeue("wB")  # B re-claims (attempt 2)
+
+        # A's stale fail must be dropped, not retried: job stays owned by B and is
+        # NOT resurrected into a fresh pending row or a bumped attempt.
+        self.assertIsNone(q.fail(jid, "stale error", worker_id="wA"))
+
+        states = q.count_by_state()
+        self.assertEqual(states.get(State.RUNNING), 1)
+        # attempts unchanged: still on B's attempt 2, not bumped by A's fail.
+        self.assertEqual(b.attempts, 2)
+
+
 class RetryTests(unittest.TestCase):
     def test_backoff_then_dead(self):
         clk = FakeClock(1000.0)  # wall clock drives run_at/backoff

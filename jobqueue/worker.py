@@ -88,9 +88,9 @@ def _child_entry(
             raise RuntimeError(f"no handler registered for job_type={job_id!r}")
         result = handler(payload)
     except BaseException:  # noqa: BLE001 — every failure path must reach fail()
-        q.fail(job_id, traceback.format_exc())
+        q.fail(job_id, traceback.format_exc(), worker_id)
     else:
-        q.complete(job_id, result)
+        q.complete(job_id, result, worker_id)
 
 
 def _serve_worker(

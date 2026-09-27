@@ -424,11 +424,31 @@ class JobQueue:
                 conn.execute("ROLLBACK")
                 raise
 
-    def complete(self, job_id: int, result: dict) -> None:
-        """Mark a running job done and store its result."""
+    def complete(
+        self, job_id: int, result: dict, worker_id: Optional[str] = None
+    ) -> None:
+        """Mark a running job done and store its result.
+
+        When `worker_id` is provided, ownership is enforced: the row must still
+        be owned (state='running') by exactly that worker. A worker whose lease
+        has expired mid-job therefore cannot overwrite the report of the worker
+        who legitimately re-claimed the job — this is what keeps the at-most-once
+        guarantee honest against the at-least-once semantics above.
+
+        If that match yields zero rows the stale report is silently dropped: it
+        is a no-op, not an error. Raising here would surface as a spurious worker
+        failure and could mask the live owner's real result; dropping avoids both.
+        When `worker_id` is None (single-process / legacy callers) behaviour is
+        unchanged — match on id + running only, raising ValueError otherwise.
+        """
         now = self._wall_now()
+        params: list = [self._dumps(result), now, job_id]
+        where = "id = ?"
+        if worker_id is not None:
+            params.append(worker_id)
+            where += " AND worker_id = ?"
         cur = self._ensure_connected().execute(
-            """
+            f"""
             UPDATE jobs
                SET state = 'done',
                    worker_id = NULL,
@@ -436,31 +456,90 @@ class JobQueue:
                    result = ?,
                    error = NULL,
                    updated_at = ?
-             WHERE id = ? AND state = 'running'
+             WHERE {where} AND state = 'running'
             """,
-            (self._dumps(result), now, job_id),
+            params,
         )
         self._conn.commit()
+        if cur.rowcount == 0 and worker_id is not None:
+            # Job no longer ours: a later worker re-claimed it after our lease
+            # expired. Our report describes stale work — drop it, don't raise.
+            return
         if cur.rowcount != 1:
             raise ValueError(f"no running job with id={job_id}")
 
-    def fail(self, job_id: int, error: str) -> None:
-        """Record a failure; retry with backoff until attempts are exhausted."""
+    def fail(
+        self, job_id: int, error: str, worker_id: Optional[str] = None
+    ) -> None:
+        """Record a failure; retry with backoff until attempts are exhausted.
+
+        When `worker_id` is provided, ownership is enforced against (id,
+        state='running') so only the current owner can push this job back to
+        pending (or dead). This closes the exactly-once hole from finding #1:
+        a worker whose lease expired mid-job must not be able to move a job that
+        another worker now owns.
+
+        If that guard matches zero rows we silently drop the stale failure and
+        return. It is deliberately *not* treated as success nor retried: a
+        legitimate re-claim already produced its own fresh attempt accounting in
+        dequeue, so our report would only double-count attempts or resurrect a
+        job someone else owns. (This is finding #3 — a stale fail must never be
+        mistaken for a failure worth retrying.)
+        """
         now = self._wall_now()
-        row = self._ensure_connected().execute(
-            "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"no job with id={job_id}")
 
-        # `attempts` is the dispatch count already bumped when the job was claimed.
-        # We do not bump it again here: this is still that same attempt, now failing.
+        if worker_id is None:
+            # Legacy / single-process path: unchanged behaviour.
+            row = self._ensure_connected().execute(
+                "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"no job with id={job_id}")
+
+            # `attempts` is the dispatch count already bumped when the job was claimed.
+            # We do not bump it again here: this is still that same attempt, now failing.
+            attempts = row["attempts"]
+            new_state, run_at = (
+                (State.DEAD, None)
+                if attempts >= row["max_attempts"]
+                else (State.PENDING, now + self._backoff(attempts))
+            )
+
+            cur = self._ensure_connected().execute(
+                """
+                UPDATE jobs
+                   SET state = ?,
+                       worker_id = NULL,
+                       lease_expires = NULL,
+                       error = ?,
+                       run_at = COALESCE(?, run_at),
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                (new_state, error, run_at, now, job_id),
+            )
+            self._conn.commit()
+            if cur.rowcount != 1:
+                raise ValueError(f"no job with id={job_id}")
+            return
+
+        # Ownership-enforced path: only act while we are still the live owner.
+        try:
+            row = self._ensure_connected().execute(
+                "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return  # vanished already — nothing to do
+        except sqlite3.Error:  # pragma: no cover - connection teardown edge
+            return
+
+        # `attempts` was bumped on claim; this is still that same failing attempt.
         attempts = row["attempts"]
-        if attempts >= row["max_attempts"]:
-            state, run_at = State.DEAD, None
-        else:
-            state, run_at = State.PENDING, now + self._backoff(attempts)
-
+        new_state, run_at = (
+            (State.DEAD, None)
+            if attempts >= row["max_attempts"]
+            else (State.PENDING, now + self._backoff(attempts))
+        )
         cur = self._ensure_connected().execute(
             """
             UPDATE jobs
@@ -470,13 +549,15 @@ class JobQueue:
                    error = ?,
                    run_at = COALESCE(?, run_at),
                    updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND worker_id = ? AND state = 'running'
             """,
-            (state, error, run_at, now, job_id),
+            (new_state, error, run_at, now, job_id, worker_id),
         )
         self._conn.commit()
-        if cur.rowcount != 1:
-            raise ValueError(f"no job with id={job_id}")
+        if cur.rowcount == 0:
+            # Not our job anymore: lease expired and another worker re-claimed it.
+            # Drop the stale failure — do not raise, do not retry.
+            return
 
     # --------------------------------------------------------------- introspection
     def count_by_state(self) -> dict[str, int]:
