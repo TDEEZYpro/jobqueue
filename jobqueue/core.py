@@ -36,10 +36,47 @@ import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-__all__ = ["JobQueue", "Job", "State"]
+__all__ = ["JobQueue", "Job", "State", "QueueError", "OwnershipError", "JobNotFound"]
+
+
+class QueueError(Exception):
+    """Base class for all errors raised by :class:`JobQueue`."""
+
+
+class OwnershipError(QueueError):
+    """A guarded write matched zero rows and could not be applied.
+
+    Raised whenever an ownership-guarded update (``complete``/``fail`` with a
+    ``worker_id``) matches no row. That outcome is ambiguous: it can mean the
+    job still exists but now belongs to another worker (a *stale* report after
+    our lease expired and someone re-claimed it), or that there is no such job
+    at all. We disambiguate with a cheap existence probe so callers can tell the
+    two apart — ``.stale`` is True in the former case, False in the latter.
+    """
+
+    def __init__(self, job_id, *, stale: bool) -> None:
+        self.job_id = job_id
+        self.stale = stale
+        self.missing = not stale  # convenience inverse
+        msg = (
+            f"job {job_id} exists but is no longer owned by this worker "
+            f"(lease expired; claimed by another worker)"
+            if stale
+            else f"no such job: {job_id}"
+        )
+        super().__init__(msg)
+
+
+class JobNotFound(QueueError):
+    """A targeted read (detail/recover/delete) found no row for the id."""
+
+    def __init__(self, job_id) -> None:
+        self.job_id = job_id
+        super().__init__(f"no such job: {job_id}")
 
 
 class State:
+    PENDING = "pending"
     PENDING = "pending"
     RUNNING = "running"
     DONE = "done"
@@ -301,6 +338,26 @@ class JobQueue:
         secs = self.backoff_base * (2 ** (attempts - 1))
         return min(secs, self.backoff_cap)
 
+    def _enforce(self, rowcount: int, job_id: int) -> None:
+        """Guard a guarded write against an unexpected rowcount.
+
+        A matching count of 1 means success (already committed). Any other count
+        from an ownership-guarded update means our worker no longer owned the
+        row — either it was reclaimed after our lease lapsed (stale) or the job
+        does not exist at all. Probe existence once so the resulting
+        :class:`OwnershipError` tells those two cases apart; this is why the
+        parameter must be required rather than an opt-out.
+        """
+        if rowcount == 1:
+            return
+        exists = (
+            self._ensure_connected().execute(
+                "SELECT 1 FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            is not None
+        )
+        raise OwnershipError(job_id, stale=exists)
+
     def _row_to_job(self, row: sqlite3.Row) -> Job:
         return Job(
             id=row["id"],
@@ -424,31 +481,23 @@ class JobQueue:
                 conn.execute("ROLLBACK")
                 raise
 
-    def complete(
-        self, job_id: int, result: dict, worker_id: Optional[str] = None
-    ) -> None:
+    def complete(self, job_id: int, result: dict, worker_id: str) -> None:
         """Mark a running job done and store its result.
 
-        When `worker_id` is provided, ownership is enforced: the row must still
-        be owned (state='running') by exactly that worker. A worker whose lease
-        has expired mid-job therefore cannot overwrite the report of the worker
-        who legitimately re-claimed the job — this is what keeps the at-most-once
-        guarantee honest against the at-least-once semantics above.
+        `worker_id` is required: ownership enforcement is the *default*, never an
+        opt-out. The row must still be owned (state='running') by exactly this
+        worker, so a worker whose lease expired mid-job cannot overwrite the
+        report of the worker who legitimately re-claimed it — this keeps the
+        at-most-once guarantee honest against at-least-once dispatch.
 
-        If that match yields zero rows the stale report is silently dropped: it
-        is a no-op, not an error. Raising here would surface as a spurious worker
-        failure and could mask the live owner's real result; dropping avoids both.
-        When `worker_id` is None (single-process / legacy callers) behaviour is
-        unchanged — match on id + running only, raising ValueError otherwise.
+        A zero-match report is an :class:`OwnershipError`, not a silent drop and
+        not a spurious failure: our own worker process knows to treat it as an
+        expected no-op (the job was already handed on); external callers get the
+        signal. See :class:`OwnershipError` for the stale-vs-missing split.
         """
         now = self._wall_now()
-        params: list = [self._dumps(result), now, job_id]
-        where = "id = ?"
-        if worker_id is not None:
-            params.append(worker_id)
-            where += " AND worker_id = ?"
         cur = self._ensure_connected().execute(
-            f"""
+            """
             UPDATE jobs
                SET state = 'done',
                    worker_id = NULL,
@@ -456,84 +505,44 @@ class JobQueue:
                    result = ?,
                    error = NULL,
                    updated_at = ?
-             WHERE {where} AND state = 'running'
+             WHERE id = ? AND state = 'running' AND worker_id = ?
             """,
-            params,
+            (self._dumps(result), now, job_id, worker_id),
         )
         self._conn.commit()
-        if cur.rowcount == 0 and worker_id is not None:
-            # Job no longer ours: a later worker re-claimed it after our lease
-            # expired. Our report describes stale work — drop it, don't raise.
-            return
-        if cur.rowcount != 1:
-            raise ValueError(f"no running job with id={job_id}")
+        self._enforce(cur.rowcount, job_id)
 
-    def fail(
-        self, job_id: int, error: str, worker_id: Optional[str] = None
-    ) -> None:
+    def fail(self, job_id: int, error: str, worker_id: str) -> None:
         """Record a failure; retry with backoff until attempts are exhausted.
 
-        When `worker_id` is provided, ownership is enforced against (id,
-        state='running') so only the current owner can push this job back to
-        pending (or dead). This closes the exactly-once hole from finding #1:
-        a worker whose lease expired mid-job must not be able to move a job that
-        another worker now owns.
+        `worker_id` is required (enforcement is the default). The job is pushed
+        back to pending — or dead once `attempts` is exhausted — only while this
+        worker is still the live owner (state='running'). This closes the
+        exactly-once hole from finding #1: a worker whose lease expired mid-job
+        cannot move a job another worker now owns.
 
-        If that guard matches zero rows we silently drop the stale failure and
-        return. It is deliberately *not* treated as success nor retried: a
-        legitimate re-claim already produced its own fresh attempt accounting in
-        dequeue, so our report would only double-count attempts or resurrect a
-        job someone else owns. (This is finding #3 — a stale fail must never be
-        mistaken for a failure worth retrying.)
+        A zero-match report raises :class:`OwnershipError` rather than being
+        silently dropped: it is neither a success nor a retryable failure (a
+        legitimate re-claim already logged its own fresh attempt), so raising
+        keeps the signal explicit for external callers while our own worker
+        process treats it as an expected no-op. Stale-vs-missing is disambiguated
+        by :meth:`_enforce` / :class:`OwnershipError`. If the row does not exist
+        at all we raise :class:`JobNotFound`, which carries enough to be caught
+        separately.
         """
         now = self._wall_now()
 
-        if worker_id is None:
-            # Legacy / single-process path: unchanged behaviour.
-            row = self._ensure_connected().execute(
-                "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
-            if row is None:
-                raise ValueError(f"no job with id={job_id}")
+        # Read attempt bookkeeping first. `attempts` was already bumped on claim,
+        # so this is that same (now failing) attempt — we never bump it again.
+        row = self._ensure_connected().execute(
+            "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            # Not an ownership conflict — the job genuinely does not exist. One
+            # exception type with .stale=False so callers distinguish this from a
+            # stale reclaim (.stale=True), matching complete() exactly.
+            raise OwnershipError(job_id, stale=False)
 
-            # `attempts` is the dispatch count already bumped when the job was claimed.
-            # We do not bump it again here: this is still that same attempt, now failing.
-            attempts = row["attempts"]
-            new_state, run_at = (
-                (State.DEAD, None)
-                if attempts >= row["max_attempts"]
-                else (State.PENDING, now + self._backoff(attempts))
-            )
-
-            cur = self._ensure_connected().execute(
-                """
-                UPDATE jobs
-                   SET state = ?,
-                       worker_id = NULL,
-                       lease_expires = NULL,
-                       error = ?,
-                       run_at = COALESCE(?, run_at),
-                       updated_at = ?
-                 WHERE id = ?
-                """,
-                (new_state, error, run_at, now, job_id),
-            )
-            self._conn.commit()
-            if cur.rowcount != 1:
-                raise ValueError(f"no job with id={job_id}")
-            return
-
-        # Ownership-enforced path: only act while we are still the live owner.
-        try:
-            row = self._ensure_connected().execute(
-                "SELECT attempts, max_attempts FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
-            if row is None:
-                return  # vanished already — nothing to do
-        except sqlite3.Error:  # pragma: no cover - connection teardown edge
-            return
-
-        # `attempts` was bumped on claim; this is still that same failing attempt.
         attempts = row["attempts"]
         new_state, run_at = (
             (State.DEAD, None)
@@ -549,15 +558,219 @@ class JobQueue:
                    error = ?,
                    run_at = COALESCE(?, run_at),
                    updated_at = ?
-             WHERE id = ? AND worker_id = ? AND state = 'running'
+             WHERE id = ? AND state = 'running' AND worker_id = ?
             """,
             (new_state, error, run_at, now, job_id, worker_id),
         )
         self._conn.commit()
-        if cur.rowcount == 0:
-            # Not our job anymore: lease expired and another worker re-claimed it.
-            # Drop the stale failure — do not raise, do not retry.
-            return
+        self._enforce(cur.rowcount, job_id)
+
+    # ----------------------------------------- admin-facing operations
+    # These back the HTTP admin API (see jobqueue/admin.py). Each opens its own
+    # short-lived connection through self._ensure_connected(); the admin server
+    # holds NO shared queue object with the worker pool, so a request can never
+    # hold a worker's write transaction open. Read paths here are plain
+    # autocommit SELECTs (no BEGIN IMMEDIATE), so under WAL they never block the
+    # single writer — see the comment in admin.py on connection isolation.
+
+    @staticmethod
+    def _decode_cursor(cursor: Optional[str]) -> Optional[dict]:
+        """Decode an opaque base64 JSON cursor: {"ca": created_at, "id": id}."""
+        if not cursor:
+            return None
+        import base64 as _b
+
+        try:
+            blob = _b.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+            data = json.loads(blob)
+            return {"ca": float(data["ca"]), "id": int(data["id"])}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"invalid cursor: {exc}") from exc
+
+    @staticmethod
+    def _encode_cursor(row: sqlite3.Row) -> str:
+        import base64 as _b
+
+        payload = json.dumps({"ca": row["created_at"], "id": row["id"]})
+        return _b.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+    def list_jobs(
+        self,
+        *,
+        state: Optional[str] = None,
+        types: Optional[Iterable[str]] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str]]:
+        """Return (jobs, next_cursor) using cursor-based pagination.
+
+        WHY CURSOR, NOT OFFSET. A queue grows unbounded and its rows are
+        constantly inserted, state-flipped and deleted underneath readers. An
+        OFFSET/limit scan both costs O(offset) work every page and shifts its
+        whole result set whenever a row is added or reclaimed ahead of the page —
+        so page 3 today can contain a job that disappears on the next query. A
+        cursor encodes the last (created_at, id) seen; the next page resumes
+        strictly after it with a single indexed range scan and an identical view
+        each time it is called. It is monotonic, cheap and stable across inserts,
+        which is exactly what a growing append-mostly table needs.
+
+        Ordering is (created_at ASC, id ASC): oldest-first FIFO within priority
+        class creation, which also makes "oldest pending age" meaningful below.
+        Cursor equality is tied up with the primary key (id), so concurrent
+        insertions at the same millisecond cannot reorder the stream.
+        """
+        limit_n = int(limit)
+        if limit_n < 1:
+            raise ValueError("limit must be >= 1")
+        # Clamp hard: a runaway client must not ask us to materialise millions of
+        # rows. One extra row lets us know whether another page exists.
+        limit_n = min(max(limit_n, 1), 1000)
+
+        conn = self._ensure_connected()
+        clauses: list[str] = []
+        params: list = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        allowed = tuple(types) if types else None
+        if allowed:
+            placeholders = ",".join("?" for _ in allowed)
+            clauses.append(f"job_type IN ({placeholders})")
+            params.extend(allowed)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        start = ""
+        start_params: list = []
+        c = self._decode_cursor(cursor)
+        if c is not None:
+            # Resume strictly after the cursor. created_at can collide at same
+            # ms, so the id tiebreaker preserves a total order (see docstring).
+            joiner = " AND" if clauses else " WHERE"
+            start = f"{joiner} (created_at > ? OR (created_at = ? AND id > ?))"
+            start_params = [c["ca"], c["ca"], c["id"]]
+
+        rows = conn.execute(
+            f"""
+            SELECT * FROM jobs{where}{start}
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            # Fetch one extra row (the sentinel) so a page knows whether another
+            # exists without an additional COUNT. Don't surface that overflow row.
+            (*params, *start_params, limit_n + 1),
+        ).fetchall()
+
+        # Overflow row beyond the page tells us another page exists but must not
+        # itself appear in this page's items. The cursor then resumes strictly
+        # after the last returned item (items[-1]).
+        more = len(rows) > limit_n
+        items = [self._row_to_detail(r) for r in rows[:limit_n]]
+        next_cursor = self._encode_cursor(items[-1]) if more else None
+        return items, next_cursor
+
+    def _row_to_detail(self, row: sqlite3.Row) -> dict:
+        """Rich single-job view used by GET /jobs/<id> and list_jobs."""
+        return {
+            "id": row["id"],
+            "job_type": row["job_type"],
+            "payload": self._loads(row["payload"]),
+            "priority": row["priority"],
+            "state": row["state"],
+            "run_at": row["run_at"],
+            "attempts": row["attempts"],
+            "max_attempts": row["max_attempts"],
+            "worker_id": row["worker_id"],
+            "lease_expires": row["lease_expires"],
+            "error": row["error"],
+            "result": self._loads(row["result"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def fetch_job_detail(self, job_id: int) -> dict:
+        """Full detail for one job (incl. attempts and last error) or None."""
+        row = self._ensure_connected().execute(
+            "SELECT * FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return None if row is None else self._row_to_detail(row)
+
+    def recover(self, job_id: int) -> dict:
+        """Revive a DEAD job back to PENDING with attempts reset to 0.
+
+        An operator escape hatch. Must be called only when the job is actually
+        DEAD; reviving anything else would resurrect an in-flight or completed
+        outcome and violate the exactly-once contract, so we refuse it (a
+        ValueError → HTTP 409). Attempts are reset so the revived job gets a full
+        fresh budget. There is deliberately no worker_id guard: recovery is a
+        privileged operator action that intentionally overrides the queue's own
+        terminal state, not a worker reporting on work it owns.
+        """
+        now = self._wall_now()
+        row = self._ensure_connected().execute(
+            "SELECT state FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise JobNotFound(job_id)
+        if row["state"] != State.DEAD:
+            raise ValueError(
+                f"cannot revive job {job_id}: not dead (state={row['state']})"
+            )
+        conn = self._ensure_connected()
+        conn.execute(
+            """
+            UPDATE jobs
+               SET state = 'pending',
+                   attempts = 0,
+                   run_at = ?,
+                   error = NULL,
+                   worker_id = NULL,
+                   lease_expires = NULL,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (now, now, job_id),
+        )
+        conn.commit()
+        detail = self.fetch_job_detail(job_id)
+        assert detail is not None  # we just created a pending row for this id
+        return detail
+
+    def delete_job(self, job_id: int) -> None:
+        """Delete a job, refusing if it is currently running.
+
+        A running job is leased to a live worker; deleting its row would make the
+        worker's eventual complete()/fail() match nothing and leave the work in
+        limbo (the worker thinks it owns something that no longer exists). Any
+        other state — pending, done, failed, dead — is safely removable. A
+        non-existent id raises JobNotFound so callers can distinguish 404 from
+        409.
+        """
+        row = self._ensure_connected().execute(
+            "SELECT state FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise JobNotFound(job_id)
+        if row["state"] == State.RUNNING:
+            raise ValueError(f"cannot delete running job {job_id}")
+        conn = self._ensure_connected()
+        conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        conn.commit()
+
+    def oldest_pending_age(self) -> Optional[float]:
+        """Seconds since the oldest now-runnable pending job was created.
+
+        Only considers jobs whose run_at has passed (truly runnable); a job
+        scheduled for the future is not 'pending' in the actionable sense. None
+        when there are no pending jobs — lets /stats report a clean 0 vs a null.
+        """
+        now = self._wall_now()
+        row = self._ensure_connected().execute(
+            "SELECT MIN(created_at) AS c FROM jobs WHERE state = 'pending' AND run_at <= ?",
+            (now,),
+        ).fetchone()
+        if row["c"] is None:
+            return None
+        return max(0.0, now - float(row["c"]))
 
     # --------------------------------------------------------------- introspection
     def count_by_state(self) -> dict[str, int]:

@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from jobqueue import JobQueue, State
+from jobqueue import JobQueue, OwnershipError, State
 
 
 class FakeClock:
@@ -77,7 +77,7 @@ class LifecycleTests(unittest.TestCase):
         jid = q.enqueue("t", {"x": 1})
         job = q.dequeue("w")
         self.assertIsNotNone(job)
-        q.complete(jid, {"ok": True})
+        q.complete(jid, {"ok": True}, worker_id="w")
         states = q.count_by_state()
         self.assertEqual(states.get(State.DONE), 1)
         self.assertEqual(states.get(State.RUNNING), 0)
@@ -85,18 +85,31 @@ class LifecycleTests(unittest.TestCase):
     def test_complete_wrong_state_raises(self):
         q, _ = make_queue()
         jid = q.enqueue("t", {})
-        with self.assertRaises(ValueError):
-            q.complete(jid, {})  # still pending
+        with self.assertRaises(OwnershipError):
+            q.complete(jid, {}, worker_id="w")  # pending -> not ours
+
+    def test_complete_missing_job_raises_not_stale(self):
+        """A complete() on a job id that does not exist returns the same zero-match
+        shape as a stale report; it must be marked missing (stale=False) so callers
+        can tell the two apart, never fabricated as done."""
+        q = JobQueue(":memory:")
+        jid = q.enqueue("t", {})
+        with self.assertRaises(OwnershipError) as ctx:
+            q.complete(jid + 999999, {}, worker_id="wA")
+        self.assertFalse(ctx.exception.stale)
+        self.assertEqual(q.count_by_state().get(State.DONE), 0)
 
 
 class OwnershipTests(unittest.TestCase):
     """Proves complete()/fail() reject a stale worker who lost the job.
 
     This is finding #1: without an ownership guard, a worker whose lease expired
-    mid-job could overwrite the report of the worker who re-claimed it. A new,
-    optional `worker_id` argument makes completion/failure match on (id,
-    state='running', worker_id); matching zero rows is a silent drop, never a
-    retry (finding #3).
+    mid-job could overwrite the report of the worker who re-claimed it. The
+    required `worker_id` argument makes completion/failure match on (id,
+    state='running', worker_id). Matching zero rows now raises OwnershipError —
+    not a silent drop and not a retry (finding #3) — so a stale report is an
+    explicit signal rather than swallowed behaviour, while our own worker treats
+    that same exception as an expected no-op. Stale-vs-missing is disambiguated.
     """
 
     def test_stale_complete_is_rejected_but_live_owner_completes(self):
@@ -115,12 +128,15 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(b.id, jid)
         self.assertEqual(b.attempts, 2)
 
-        # A's report is now stale: it must be silently dropped, not raise and
-        # not overwrite the live owner.
-        self.assertIsNone(q.complete(jid, {"stale": True}, worker_id="wA"))
+        # A's report is now stale (B owns the job): raise, don't drop and don't
+        # overwrite the live owner.
+        with self.assertRaises(OwnershipError) as ctx:
+            q.complete(jid, {"stale": True}, worker_id="wA")
+        self.assertTrue(ctx.exception.stale)
+        self.assertEqual(ctx.exception.job_id, jid)
 
         # B's report wins: job completes exactly once.
-        self.assertIsNone(q.complete(jid, {"ok": True}, worker_id="wB"))
+        q.complete(jid, {"ok": True}, worker_id="wB")
 
         states = q.count_by_state()
         self.assertEqual(states.get(State.DONE), 1)
@@ -136,14 +152,27 @@ class OwnershipTests(unittest.TestCase):
         lease.advance(31.0)  # lease expires
         b = q.dequeue("wB")  # B re-claims (attempt 2)
 
-        # A's stale fail must be dropped, not retried: job stays owned by B and is
-        # NOT resurrected into a fresh pending row or a bumped attempt.
-        self.assertIsNone(q.fail(jid, "stale error", worker_id="wA"))
+        # A's stale fail must be dropped from B's perspective: it raises
+        # OwnershipError(stale=True), is NOT retried, and the job stays owned by
+        # B with attempts intact. (Our own worker would swallow this exception.)
+        with self.assertRaises(OwnershipError) as ctx:
+            q.fail(jid, "stale error", worker_id="wA")
+        self.assertTrue(ctx.exception.stale)
+        self.assertEqual(ctx.exception.job_id, jid)
 
         states = q.count_by_state()
         self.assertEqual(states.get(State.RUNNING), 1)
         # attempts unchanged: still on B's attempt 2, not bumped by A's fail.
         self.assertEqual(b.attempts, 2)
+
+    def test_fail_missing_job_raises_not_stale(self):
+        """Failing a job that does not exist must raise OwnershipError(stale=False),
+        never a retry and never a fabricated pending/dead row."""
+        q = JobQueue(":memory:")
+        jid = q.enqueue("t", {})
+        with self.assertRaises(OwnershipError) as ctx:
+            q.fail(jid + 999999, "boom", worker_id="wA")
+        self.assertFalse(ctx.exception.stale)
 
 
 class RetryTests(unittest.TestCase):
@@ -155,7 +184,7 @@ class RetryTests(unittest.TestCase):
         # attempt 1 fails -> retry at +1s (base * 2**0)
         job = q.dequeue("w")
         self.assertEqual(job.attempts, 1)
-        q.fail(jid, "boom")
+        q.fail(jid, "boom", worker_id="w")
         self.assertEqual(q.count_by_state().get(State.PENDING), 1)
         # not runnable yet (run_at in the future on the wall clock)
         self.assertIsNone(q.dequeue("w"))
@@ -164,12 +193,12 @@ class RetryTests(unittest.TestCase):
         clk.advance(1.0)
         job2 = q.dequeue("w")
         self.assertEqual(job2.attempts, 2)
-        q.fail(jid, "boom again")  # attempt 2 -> retry at +2s
+        q.fail(jid, "boom again", worker_id="w")  # attempt 2 -> retry at +2s
 
         clk.advance(2.0)
         job3 = q.dequeue("w")
         self.assertEqual(job3.attempts, 3)
-        q.fail(jid, "final")  # attempts==max_attempts -> dead
+        q.fail(jid, "final", worker_id="w")  # attempts==max_attempts -> dead
 
         states = q.count_by_state()
         self.assertEqual(states.get(State.DEAD), 1)
@@ -181,10 +210,10 @@ class RetryTests(unittest.TestCase):
         q, _ = make_queue(clock=clk, max_attempts=5, backoff_base=1.0)
         jid = q.enqueue("t", {})
         job = q.dequeue("w")
-        q.fail(jid, "transient")
+        q.fail(jid, "transient", worker_id="w")
         clk.advance(1.0)
         self.assertEqual(q.dequeue("w").id, jid)  # retried fine
-        q.complete(jid, {"done": True})
+        q.complete(jid, {"done": True}, worker_id="w")
 
 
 class LeaseTests(unittest.TestCase):

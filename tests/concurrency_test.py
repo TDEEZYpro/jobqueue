@@ -33,7 +33,7 @@ def drain_worker(db_path: str, worker_id: str, completed) -> int:
             if job is None:
                 break
             # simulate work; complete atomically via SQLite
-            q.complete(job.id, {"worker": worker_id})
+            q.complete(job.id, {"worker": worker_id}, worker_id)
             completed.append(job.id)
             n += 1
     finally:

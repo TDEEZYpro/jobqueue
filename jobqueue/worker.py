@@ -49,7 +49,7 @@ import time
 import traceback
 from typing import Callable, Optional
 
-from .core import JobQueue
+from .core import JobQueue, OwnershipError
 
 # handler(job_payload: dict) -> result dict
 Handler = Callable[[dict], dict]
@@ -88,9 +88,20 @@ def _child_entry(
             raise RuntimeError(f"no handler registered for job_type={job_id!r}")
         result = handler(payload)
     except BaseException:  # noqa: BLE001 — every failure path must reach fail()
-        q.fail(job_id, traceback.format_exc(), worker_id)
+        try:
+            q.fail(job_id, traceback.format_exc(), worker_id)
+        except OwnershipError:
+            # Stale report: our lease lapsed and another worker re-claimed the
+            # job. It already logged its own attempt, so ours would be wrong —
+            # expected no-op, never a failure worth surfacing.
+            pass
     else:
-        q.complete(job_id, result, worker_id)
+        try:
+            q.complete(job_id, result, worker_id)
+        except OwnershipError:
+            # Same story for a success reported after our lease expired: the job
+            # is owned by someone else now. Drop the stale report quietly.
+            pass
 
 
 def _serve_worker(
