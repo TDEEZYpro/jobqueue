@@ -83,8 +83,8 @@ class JobQueue:
         backoff_cap: float = DEFAULT_BACKOFF_CAP,
         visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT,
         busy_timeout_ms: int = 5000,
-        clock=lambda: time.time(),            # wall clock → run_at scheduling
-        lease_clock=lambda: time.monotonic(),  # monotonic → lease lifetime
+        clock=time.time,            # wall clock → run_at scheduling (evaluated each call)
+        lease_clock=time.monotonic,  # monotonic → lease lifetime (evaluated each call)
     ) -> None:
         self.db_path = os.fspath(db_path)
         self.max_attempts = max_attempts
@@ -92,14 +92,20 @@ class JobQueue:
         self.backoff_cap = min(backoff_cap, backoff_base * 64.0)
         self.visibility_timeout = visibility_timeout
         self.busy_timeout_ms = busy_timeout_ms
+        # NOTE: we pass the functions themselves (time.time / time.monotonic),
+        # NOT their call results. A bare `time.monotonic` is a callable invoked
+        # per-read by `_lease_now`; passing `time.monotonic()` would bind clock
+        # to a single frozen value captured at import/construct time.
         self._wall_clock = clock  # time.time(): schedules run_at bookkeeping
         self._lease_clock = lease_clock  # time.monotonic(): bounds lease lifetime
         # A lock only guards our in-process state machine (the single connection
         # we own), never SQLite itself — cross-process safety comes from SQLite.
         self._conn_lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
+        self._boot_synced = False  # one-time per-boot lease invalidation (see _sync_boot_ref)
         self._ensure_connected().row_factory = sqlite3.Row
         self._create_schema()
+        self._sync_boot_ref()
 
     # ------------------------------------------------------------------ conn
     def _ensure_connected(self) -> sqlite3.Connection:
@@ -153,6 +159,12 @@ class JobQueue:
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_lookup
                 ON jobs (state, run_at, priority DESC, id);
+            -- One-row store of the current boot's identity (see _sync_boot_ref).
+            -- ``value`` is TEXT: it holds a per-boot identifier (boot_id) on Linux.
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -176,18 +188,103 @@ class JobQueue:
         is exactly why it is the correct clock here: a lease's expiry survives a
         worker (re)start and other processes share the same reference.
 
-        Defined behaviour at restart: we do nothing special — leases keep being
-        evaluated against this same monotonic baseline, so a job held by a
-        worker that was merely re-executed is reclaimed only after its full
-        visibility window has genuinely elapsed. The one case where the baseline
-        *does* reset (a full machine reboot / kexec) would make previously stored
-        lease_expires larger than the fresh baseline and thus delayed, never
-        premature: leases are reclaimed late by up to one window, which preserves
-        the lease invariant of never re-running a job that may still be live. We
-        accept that trade-off rather than paying for a startup sweep — the cost
-        is bounded latency after a reboot, and no double execution ever.
+        Defined behaviour at restart: leases survive a worker (re)start because
+        CLOCK_MONOTONIC keeps its baseline across process restarts — a job held by
+        a re-executed worker is not reclaimed until its window genuinely elapses.
+        BUT a full machine reboot / kexec *does* reset the monotonic baseline to
+        ~0. A lease stamped on the pre-reboot uptime (e.g. up(216000s)+30 for a
+        box that was up 2.5 days) would then be *larger* than every future now,
+        so it would never expire by lease expiry: the stuck job could sit in
+        `running` for the entire previous uptime (days), not one window. We do
+        not accept that, so _sync_boot_ref() detects the reset and invalidates
+        stale leases — see that method for why that is safe.
         """
         return float(self._lease_clock())
+
+    def _current_boot_id(self) -> Optional[str]:
+        """Identity of the current boot — stable within a boot, changes at reboot.
+
+        Linux exposes /proc/sys/kernel/random/boot_id: a freshly generated 128-bit
+        random UUID assigned at every boot and left unchanged for the lifetime of
+        that boot. It is the right primitive here because it changes *per boot*
+        regardless of uptime, unlike CLOCK_MONOTONIC (which only counts up from
+        boot and therefore cannot tell a late-boot second apart from a post-reboot
+        second past the old mark — see _sync_boot_ref). Returns None when the
+        source is unavailable.
+
+        Platform without boot_id: we fall back to CLOCK_MONOTONIC ordering as a
+        best effort (now < stored monotonic baseline), which catches reboots that
+        reconnect before their uptime passes the prior mark but still leaves a
+        residual gap — exactly the missed case above. Identity comparison is used
+        whenever available; only then is this fallback active.
+        """
+        path = "/proc/sys/kernel/random/boot_id"
+        try:
+            with open(path) as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    def _sync_boot_ref(self) -> None:
+        """Recover in-flight leases after a reboot by comparing boot identity.
+
+        A lease's expiry is measured on CLOCK_MONOTONIC, which counts up from the
+        boot — so its value GROWS through a process's life and *cannot* tell a
+        late instant of one boot from an early instant of the next. Detecting a
+        reboot therefore needs something that changes per boot, not ordering.
+        We persist the current ``boot_id`` in ``meta.ref`` and compare by identity:
+        on connect, if the stored id differs from ours we have crossed a boot
+        boundary and invalidate stale leases.
+
+        Why identity, not ordering: ordering misses the case where a rebooted box
+        reconnects after its uptime has already passed the prior mark (e.g. up 100s,
+        reboot, first connect at 200s: 200 >= 100 → no reset signalled). boot_id is
+        fresh on every boot so that case cannot slip through.
+
+        Chosen behaviour (and why it is safe): on identity mismatch we flip all
+        `running` jobs back to `pending` (clearing worker_id/lease_expires) so the
+        next dequeue reclaims them — at-most-once replay. Because every worker dies
+        on reboot, any job still `running` was necessarily interrupted, so treating
+        the whole set as reclaimable is correct and needs no per-job tag or sweep.
+        Latency after reboot is bounded by one dequeue of the earliest-eligible job.
+
+        Does ref get refreshed every connect? No — it is written once per boot and
+        only overwritten when a *different* id is observed (i.e. at a reboot).
+        Identity does not drift, so there is no decay to chase; refreshing on every
+        connect would simply rewrite the same value.
+        """
+        if self._boot_synced:
+            return
+        self._boot_synced = True
+        conn = self._ensure_connected()
+        current_id = self._current_boot_id()
+        now = self._lease_now()  # used only by the absent-source fallback below
+        # BEGIN IMMEDIATE so the check+reset is serialized with workers writing
+        # (and against another process also doing its first-time boot sync).
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            stored = conn.execute(
+                "SELECT value FROM meta WHERE key='ref'"
+            ).fetchone()
+            prior = stored["value"] if stored else None
+            if current_id is not None:
+                rebooted = (prior != current_id)
+            else:
+                # platform without boot_id -> best-effort monotonic ordering
+                rebooted = prior is not None and now < float(prior)
+            value = current_id if current_id is not None else repr(now)
+            if prior is None:
+                conn.execute("INSERT INTO meta (key, value) VALUES ('ref', ?)", (value,))
+            elif rebooted:
+                conn.execute(
+                    "UPDATE jobs SET state='pending', worker_id=NULL, "
+                    "lease_expires=NULL WHERE state='running'"
+                )
+                conn.execute("UPDATE meta SET value=? WHERE key='ref'", (value,))
+            conn.commit()
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _dumps(obj) -> bytes:

@@ -9,6 +9,7 @@ subject of test_two_clocks_are_separate.
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from jobqueue import JobQueue, State
 
@@ -183,6 +184,81 @@ class ClockSeparationTests(unittest.TestCase):
         self.assertEqual(q.dequeue("w1").id, jid)
         lease.advance(31.0)  # visibility window elapses
         self.assertEqual(q.dequeue("w2").id, jid)  # reclaimed purely on lease clock
+
+
+class RebootTests(unittest.TestCase):
+    """Reboot detection is by boot identity (boot_id), not monotonic ordering,
+    so a box that reconnects after its uptime passes the old mark is still caught.
+    """
+
+    def test_reboot_past_old_mark_is_detected(self):
+        # Up 100s, job running under BOOT-A. Reboot; new boot already at 200s uptime
+        # — ABOVE the prior monotonic mark. Ordering would miss this; identity does not.
+        boot_a = FakeClock(100.0)
+        q_a, path = make_queue(clock=FakeClock(0.0), lease_clock=boot_a,
+                               visibility_timeout=30.0, max_attempts=3)
+        with mock.patch.object(JobQueue, "_current_boot_id", return_value="BOOT-A"):
+            jid = q_a.enqueue("t", {})
+            self.assertEqual(q_a.dequeue("w1").id, jid)  # running under BOOT-A
+
+        boot_b = FakeClock(200.0)  # new boot, uptime already past the old mark (200 > 100)
+        with mock.patch.object(JobQueue, "_current_boot_id", return_value="BOOT-B"):
+            q_b = JobQueue(path, clock=FakeClock(0.0), lease_clock=boot_b,
+                           visibility_timeout=30.0, max_attempts=3)
+        states = q_b.count_by_state()
+        self.assertEqual(states.get(State.RUNNING), 0)   # stale lease invalidated
+        self.assertEqual(states.get(State.PENDING), 1)   # back to pending
+        self.assertEqual(q_b.dequeue("w2").id, jid)
+
+    def test_same_boot_no_false_reboot(self):
+        # Same identity across processes -> never invalidates, regardless of how far
+        # the monotonic clock has advanced within the boot.
+        boot_a = FakeClock(100.0)
+        with mock.patch.object(JobQueue, "_current_boot_id", return_value="BOOT-SAME"):
+            q_a, path = make_queue(clock=FakeClock(0.0), lease_clock=boot_a,
+                                   visibility_timeout=30.0, max_attempts=3)
+            jid = q_a.enqueue("t", {})
+            self.assertEqual(q_a.dequeue("w1").id, jid)  # running
+
+            boot_b = FakeClock(120.0)  # advanced within the same boot (lease not yet expired)
+            q_b = JobQueue(path, clock=FakeClock(0.0), lease_clock=boot_b,
+                           visibility_timeout=30.0, max_attempts=3)
+        self.assertEqual(q_b.count_by_state().get(State.RUNNING), 1)   # not falsely reclaimed
+        self.assertEqual(q_b.dequeue("w2"), None)                       # still held
+    def test_absent_boot_id_falls_back_to_monotonic_ordering(self):
+        # Platform without boot_id: fall back to monotonic ordering. This catches a
+        # reboot that reconnects before uptime passes the prior mark (documented gap).
+        with mock.patch.object(JobQueue, "_current_boot_id", return_value=None):
+            boot_a = FakeClock(300.0)
+            q_a, path = make_queue(clock=FakeClock(0.0), lease_clock=boot_a,
+                                   visibility_timeout=30.0, max_attempts=3)
+            jid = q_a.enqueue("t", {})
+            self.assertEqual(q_a.dequeue("w1").id, jid)  # running
+
+            boot_b = FakeClock(250.0)  # reboot, uptime still below the prior 300
+            q_b = JobQueue(path, clock=FakeClock(0.0), lease_clock=boot_b,
+                           visibility_timeout=30.0, max_attempts=3)
+        states = q_b.count_by_state()
+        self.assertEqual(states.get(State.RUNNING), 0)   # detected by ordering
+        self.assertEqual(q_b.dequeue("w2").id, jid)
+
+    def test_absent_boot_id_misses_late_reconnect(self):
+        """The documented residual gap: without boot_id a reboot reconnecting after
+        the old mark is missed (monotonic ordering cannot tell apart boots). This
+        test records that behaviour so it is explicit, not accidental."""
+        with mock.patch.object(JobQueue, "_current_boot_id", return_value=None):
+            boot_a = FakeClock(100.0)  # ref stored at first connect = 100; job claimed up~100 -> lease_expires ~130
+            q_a, path = make_queue(clock=FakeClock(0.0), lease_clock=boot_a,
+                                   visibility_timeout=30.0, max_attempts=3)
+            jid = q_a.enqueue("t", {})
+            self.assertEqual(q_a.dequeue("w1").id, jid)  # running under prior ref 100
+
+            boot_b = FakeClock(120.0)  # reboot: uptime (120) > prior ref (100) -> ordering MISSES
+            q_b = JobQueue(path, clock=FakeClock(0.0), lease_clock=boot_b,
+                           visibility_timeout=30.0, max_attempts=3)
+        self.assertEqual(q_b.count_by_state().get(State.RUNNING), 1)   # still held by stale lease
+        self.assertIsNone(q_b.dequeue("w2"))  # not reclaimable until new uptime >= ~130 (self-expiry)
+
 
 
 if __name__ == "__main__":
